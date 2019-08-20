@@ -99,7 +99,7 @@ public class RowMerger implements StreamObserver<ReadRowsResponse> {
   }
 
   /** Encapsulates validation for different states based on the stream of the {@link CellChunk}. */
-  private enum RowMergerState {
+  enum RowMergerState {
 
     /** A new {@link CellChunk} represents a completely new {@link FlatRow}. */
     NewRow {
@@ -243,7 +243,7 @@ public class RowMerger implements StreamObserver<ReadRowsResponse> {
   }
 
   /** This class represents the data in the row that's currently being processed. */
-  private static final class RowInProgress {
+  static final class RowInProgress {
 
     // 50MB is pretty large for a row, so log any rows that are of that size
     private static final int LARGE_ROW_SIZE = 50 * 1024 * 1024;
@@ -358,7 +358,7 @@ public class RowMerger implements StreamObserver<ReadRowsResponse> {
       chunk.getValue().writeTo(outputStream);
     }
 
-    private ByteString getRowKey() {
+    ByteString getRowKey() {
       return rowKey;
     }
 
@@ -400,6 +400,7 @@ public class RowMerger implements StreamObserver<ReadRowsResponse> {
   private RowInProgress rowInProgress = null;
   private boolean complete = false;
   private Integer rowCountInLastMessage = null;
+  private RowKeyDebugger rowKeyDebugger = RowKeyDebugger.create();
 
   /**
    * Constructor for RowMerger.
@@ -415,12 +416,14 @@ public class RowMerger implements StreamObserver<ReadRowsResponse> {
     state = RowMergerState.NewRow;
     rowInProgress = null;
     rowCountInLastMessage = null;
+    rowKeyDebugger.onClearRowInProgress();
   }
 
   /** {@inheritDoc} */
   @Override
   public final void onNext(ReadRowsResponse readRowsResponse) {
     if (complete) {
+      rowKeyDebugger.onNextAfterComplete();
       onError(new IllegalStateException("Adding partialRow after completion"));
       return;
     }
@@ -428,18 +431,25 @@ public class RowMerger implements StreamObserver<ReadRowsResponse> {
     for (int i = 0; i < readRowsResponse.getChunksCount(); i++) {
       try {
         CellChunk chunk = readRowsResponse.getChunks(i);
+        rowKeyDebugger.beforeValidateChunk(lastCompletedRowKey, state, rowInProgress);
         state.validateChunk(rowInProgress, lastCompletedRowKey, chunk);
         if (chunk.getResetRow()) {
           rowInProgress = null;
           state = RowMergerState.NewRow;
+          rowKeyDebugger.onResetRow();
           continue;
         }
         if (state == RowMergerState.NewRow) {
           rowInProgress = new RowInProgress();
+          rowKeyDebugger.beforeNewRowUpdateKey(lastCompletedRowKey, chunk.getRowKey());
           rowInProgress.updateCurrentKey(chunk);
         } else if (state == RowMergerState.RowInProgress) {
+          rowKeyDebugger.beforeUpdateRowInProgressKey(lastCompletedRowKey, chunk);
           rowInProgress.updateCurrentKey(chunk);
         }
+
+        rowKeyDebugger.beforeUpdateChunk(lastCompletedRowKey, chunk);
+
         if (chunk.getValueSize() > 0) {
           rowInProgress.addPartialCellChunk(chunk);
           state = RowMergerState.CellInProgress;
@@ -453,11 +463,13 @@ public class RowMerger implements StreamObserver<ReadRowsResponse> {
         }
 
         if (chunk.getCommitRow()) {
+          rowKeyDebugger.beforeCommit(chunk, lastCompletedRowKey, rowInProgress);
           observer.onNext(rowInProgress.buildRow());
           lastCompletedRowKey = rowInProgress.getRowKey();
           state = RowMergerState.NewRow;
           rowInProgress = null;
           rowsProcessed++;
+          rowKeyDebugger.afterCommit(chunk, lastCompletedRowKey, rowInProgress);
         }
       } catch (Throwable e) {
         onError(e);
